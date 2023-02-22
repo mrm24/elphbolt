@@ -22,7 +22,7 @@ module phonon_module
   use params, only: r64, i64, bohr2nm, pi, twopi, Ryd2eV, oneI
   use particle_module, only: particle
   use misc, only: print_message, subtitle, expi, distribute_points, &
-       write2file_rank2_real, exit_with_message
+       write2file_rank2_real, exit_with_message, cross_product, twonorm
   use numerics_module, only: numerics
   use wannier_module, only: epw_wannier
   use crystal_module, only: crystal, calculate_wavevectors_full
@@ -804,6 +804,11 @@ contains
     complex(r64),allocatable :: dyn(:,:),dyn_s(:,:,:),dyn_g(:,:,:)
     complex(r64),allocatable :: ddyn(:,:,:),ddyn_s(:,:,:,:),ddyn_g(:,:,:,:)
 
+    !Variables for 2D cases
+    real(r64) :: c, area, reff(2,2), grg
+    complex(r64) :: a0, b0, c0, d0, a1, b1, c1, d1
+
+
     !External procedures
     external :: zheev
     
@@ -858,7 +863,24 @@ contains
     alpha=(twopi*bohr2nm/dnrm2(3,crys%lattvecs(:,1),1))**2
     geg=gmax*4.0_r64*alpha
     ncell_g=int(sqrt(geg)/self%cell_g(:,0))+1
-    
+
+    if (crys%twod) then
+      ! Remove third dimension
+      ncell_g(3) = 0_i64
+      ! Vacuum size in Bohr unit
+      c =  twopi / self%cell_g(3,3)
+      ! Area in Bohr**2
+      area = twonorm(cross_product( self%cell_r(1,:),&
+         self%cell_r(2,:)))
+      ! Effective screening length
+      ! reff = (eps - 1) * c/2
+      reff(:, :) = 0.0_r64
+      reff(:, :) = eps(1:2, 1:2) * 0.5_r64 * c ! eps * c/2
+      reff(1, 1) = reff(1, 1)    - 0.5_r64 * c ! (-1) * c/2
+      reff(2, 2) = reff(2, 2)    - 0.5_r64 * c ! (-1) * c/2
+    end if
+
+
     dyn_s = 0.0_r64
     if(present(velocities)) ddyn_s = 0.0_r64
     
@@ -936,9 +958,22 @@ contains
              do m3=-ncell_g(3),ncell_g(3)
                 g(1:3)=m1*self%cell_g(1,1:3)+&
                      m2*self%cell_g(2,1:3)+m3*self%cell_g(3,1:3)
-                geg=dot_product(g(1:3),matmul(eps,g(1:3)))
+                if(crys%twod) then
+                  geg = g(1)**2 + g(2)**2 + g(3)**2
+                  grg = 0.0_r64
+                  if (g(1)**2 + g(2)**2 .gt. 1.0e-8_r64) then
+                     grg = dot_product(g(1:2),matmul(eps(1:2, 1:2),g(1:2)))
+                     grg = grg / (g(1)**2 + g(2)**2)
+                  end if
+                else
+                  geg=dot_product(g(1:3),matmul(eps,g(1:3)))
+                end if
                 if(geg.gt.0.0_r64.and.geg/alpha/4.0_r64.lt.gmax) then
-                   exp_g=exp(-geg/alpha/4.0_r64)/geg
+                   if (crys%twod) then
+                     exp_g=exp(-geg/alpha/4.0_r64)/geg
+                   else
+                     exp_g=exp(-geg/alpha/4.0_r64)/sqrt(geg)/(1.0_r64 + grg * sqrt(geg))
+                   end if
                    do iat=1,nat
                       zig(1:3)=matmul(g(1:3),zeff(iat,1:3,1:3))
                       auxi(1:3)=0.
@@ -960,10 +995,24 @@ contains
                 g_old(0:3)=g(0:3)
                 do ik=1,nk
                    g(1:3)=g_old(1:3)+k(ik,1:3)
-                   geg=dot_product(g(1:3),matmul(eps,g(1:3)))
+                   if(crys%twod) then
+                     geg = g(1)**2 + g(2)**2 + g(3)**2
+                     grg = 0.0_r64
+                     if (g(1)**2 + g(2)**2 .gt. 1.0e-8_r64) then
+                        grg = dot_product(g(1:2),matmul(eps(1:2, 1:2),g(1:2)))
+                        grg = grg / (g(1)**2 + g(2)**2)
+                   end if
+                   else
+                     geg=dot_product(g(1:3),matmul(eps,g(1:3)))
+                   end if
                    if (geg.gt.0.0_r64.and.geg/alpha/4.0_r64.lt.gmax) then
-                      exp_g=exp(-geg/alpha/4.0_r64)/geg
-                      dgeg=matmul(eps+transpose(eps),g(1:3))
+                      if (crys%twod) then
+                        exp_g=exp(-geg/alpha/4.0_r64)/geg
+                        dgeg(1:2)=matmul(reff+transpose(reff),g(1:2))
+                      else
+                        exp_g=exp(-geg/alpha/4.0_r64)/sqrt(geg)/(1.0_r64 + grg * sqrt(geg))
+                        dgeg=matmul(eps+transpose(eps),g(1:3))
+                      end if
                       do iat=1,nat
                          zig(1:3)=matmul(g(1:3),zeff(iat,1:3,1:3))
                          do jat=1,nat
@@ -976,13 +1025,29 @@ contains
                                   dyn_g(ik,idim,jdim)=dyn_g(ik,idim,jdim)+&
                                        exp_g*zig(ipol)*zjg(jpol)*expi(gr)
                                   if(present(velocities)) then
-                                     do i=1,3
-                                        ddyn_g(ik,idim,jdim,i)=ddyn_g(ik,idim,jdim,i)+&
-                                             exp_g*expi(gr)*&
-                                             (zjg(jpol)*zeff(iat,i,ipol)+zig(ipol)*zeff(jat,i,jpol)+&
-                                             zig(ipol)*zjg(jpol)*oneI*self%rr(iat,jat,i)-&
-                                             zig(ipol)*zjg(jpol)*(dgeg(i)/alpha/4.0+dgeg(i)/geg))
-                                     end do
+                                     if (crys%twod) then
+                                       a0 = exp(-geg/alpha/4.0_r64)
+                                       b0 = zig(ipol)*zjg(jpol)
+                                       c0 = (sqrt(geg)/(1.0_r64 + grg * sqrt(geg)))
+                                       d0 = expi(gr)
+                                       do i=1,2
+                                          a1 = -g(i)*a0/(2.0_r64 * alpha)
+                                          b1 = zjg(jpol)*zeff(iat,i,ipol)+zig(ipol)*zeff(jat,i,jpol)
+                                          c1 = g(i)/sqrt(geg) + dgeg(i)
+                                          d1 = oneI*self%rr(iat,jat,i)*d0
+                                          ddyn_g(ik,idim,jdim,i)=ddyn_g(ik,idim,jdim,i) + &
+                                          (b0*d0*a1/c0) + a0 * ( d0*b1/c0 + b0 * &
+                                             (d1/c0 - d0*c1/(c0**2)))
+                                       end do
+                                     else
+                                       do i=1,3
+                                          ddyn_g(ik,idim,jdim,i)=ddyn_g(ik,idim,jdim,i)+&
+                                                exp_g*expi(gr)*&
+                                                (zjg(jpol)*zeff(iat,i,ipol)+zig(ipol)*zeff(jat,i,jpol)+&
+                                                zig(ipol)*zjg(jpol)*oneI*self%rr(iat,jat,i)-&
+                                                zig(ipol)*zjg(jpol)*(dgeg(i)/alpha/4.0+dgeg(i)/geg))
+                                       end do
+                                     end if
                                   end if
                                end do
                             end do
@@ -993,8 +1058,13 @@ contains
              end do
           end do
        end do
-       dyn_g = dyn_g*8.0_r64*pi/volume_r
-       if(present(velocities)) ddyn_g = ddyn_g*8.0_r64*pi/volume_r
+       if (crys%twod) then
+         dyn_g = dyn_g*4.0_r64*pi/area
+         if(present(velocities)) ddyn_g = ddyn_g*4.0_r64*pi/area
+       else
+         dyn_g = dyn_g*8.0_r64*pi/volume_r
+         if(present(velocities)) ddyn_g = ddyn_g*8.0_r64*pi/volume_r
+       end if
     end if
     
     ! Once the dynamical matrix has been built, the frequencies and

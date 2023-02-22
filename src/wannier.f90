@@ -20,7 +20,7 @@ module wannier_module
   use params, only: r64, i64, Ryd2eV, Ryd2radTHz, oneI, pi, twopi, twopiI, &
        Ryd2amu, bohr2nm
   use misc, only: exit_with_message, print_message, expi, twonorm, &
-       distribute_points, demux_state, mux_vector, subtitle
+       distribute_points, demux_state, mux_vector, subtitle, cross_product
   use numerics_module, only: numerics
   use crystal_module, only: crystal
   
@@ -389,6 +389,7 @@ contains
     !! dyn: the dynamical matrix
     !
     ! This is adapted from ShengBTE's subroutine phonon_espresso.
+    ! The 2D vesion is taken from rigid_epw.f90 of EPW
     ! ShengBTE is distributed under GPL v3 or later.
 
     class(epw_wannier), intent(in) :: self
@@ -400,7 +401,8 @@ contains
 
     complex(r64) :: dyn_l(self%numbranches,self%numbranches), fnat(3)
     real(r64) :: qeq, arg, zig(3), zjg(3), g(3), gmax, alph, &
-         tpiba, dgeg(3), rr(crys%numatoms,crys%numatoms,3)
+         tpiba, rr(crys%numatoms,crys%numatoms,3), &
+         qrq, c, area, reff(2,2)
     integer(i64) :: iat,jat,idim,jdim,ipol,jpol,m1,m2,m3,nq1,nq2,nq3
     complex(r64) :: fac, facqd, facq
     
@@ -410,23 +412,59 @@ contains
     !same as the EPW coarse phonon mesh.
     nq1 = self%coarse_qmesh(1)
     nq2 = self%coarse_qmesh(2)
-    nq3 = self%coarse_qmesh(3)
+    if (crys%twod) then
+      nq3 = 0
+    else
+      nq3 = self%coarse_qmesh(3)
+    end if
 
     gmax= 14.0_r64 !dimensionless
     alph= tpiba**2 !bohr^-2
-    !In Ry units, qe = sqrt(2.0)
-    fac = 8.0_r64*pi/(crys%volume/bohr2nm**3)
+
+
+    !Compute
+    if (crys%twod) then
+      ! Vacuum size in Bohr unit
+      c = twopi/(crys%reclattvecs(3,3)*bohr2nm)
+      ! Area in nm**2
+      area = twonorm(cross_product( crys%lattvecs(:,1),&
+         crys%lattvecs(:,2)))
+      !In Ry units, qe = sqrt(2.0)
+      fac =  4.0_r64*pi/(area/bohr2nm**2)
+      ! Effective screening length
+      ! reff = (epsilon - 1) * c/2
+      reff(:, :) = 0.0_r64
+      reff(:, :) = crys%epsilon(1:2, 1:2) * 0.5_r64 * c ! eps * c/2
+      reff(1, 1) = reff(1, 1) - 0.5_r64 * c ! (-1) * c/2
+      reff(2, 2) = reff(2, 2) - 0.5_r64 * c ! (-1) * c/2
+    else
+      !In Ry units, qe = sqrt(2.0)
+      fac = 8.0_r64*pi/(crys%volume/bohr2nm**3)
+    end if
 
     dyn_l = (0.0_r64, 0.0_r64)
     do m1 = -nq1,nq1
        do m2 = -nq2,nq2
           do m3 = -nq3,nq3
              g(:) = (m1*crys%reclattvecs(:,1)+m2*crys%reclattvecs(:,2)+m3*crys%reclattvecs(:,3))*bohr2nm
-             qeq = dot_product(g,matmul(crys%epsilon,g))
+
+             if(crys%twod) then
+               qeq = g(1)**2 + g(2)**2 + g(3)**2
+               qrq = 0.0_r64
+               if (g(1)**2 + g(2)**2 > 1.0e-8_r64) then
+                  qrq = g(1) * reff(1, 1) * g(1) + g(1) * reff(1, 2) * g(2) + g(2) * reff(2, 1) * g(1) + g(2) * reff(2, 2) * g(2)
+                  qrq = qrq / (g(1)**2 + g(2)**2)
+               end if
+             else
+               qeq = dot_product(g,matmul(crys%epsilon,g))
+             end if
 
              if (qeq > 0.0_r64 .and. qeq/alph/4.0_r64 < gmax ) then
-                facqd = exp(-qeq/alph/4.0_r64)/qeq
-
+                if(crys%twod) then
+                  facqd = exp(-qeq/alph/4.0_r64)/sqrt(qeq)/(1.0_r64 + qrq * sqrt(qeq))
+                else
+                  facqd = exp(-qeq/alph/4.0_r64)/qeq
+                end if
                 do iat = 1,crys%numatoms
                    zig(:)=matmul(g,crys%born(:,:,iat))
                    fnat(:)= (0.0_r64,0.0_r64)
@@ -447,11 +485,26 @@ contains
                 end do
              end if
 
+             !Shifted sum
              g = g + q
-             qeq = dot_product(g,matmul(crys%epsilon,g))
+
+             if(crys%twod) then
+               qeq = g(1)**2 + g(2)**2 + g(3)**2
+               qrq = 0.0_r64
+               if (g(1)**2 + g(2)**2 > 1.0e-8_r64) then
+                  qrq = g(1) * reff(1, 1) * g(1) + g(1) * reff(1, 2) * g(2) + g(2) * reff(2, 1) * g(1) + g(2) * reff(2, 2) * g(2)
+                  qrq = qrq / (g(1)**2 + g(2)**2)
+               end if
+             else
+               qeq = dot_product(g,matmul(crys%epsilon,g))
+             end if
+
              if (qeq > 0.0_r64 .and. qeq/alph/4.0_r64 < gmax ) then
-                facqd = exp(-qeq/alph/4.0_r64)/qeq
-                dgeg=matmul(crys%epsilon+transpose(crys%epsilon),g)
+                if(crys%twod) then
+                  facqd = exp(-qeq/alph/4.0_r64)/sqrt(qeq)/(1.0_r64 + qrq * sqrt(qeq))
+                else
+                  facqd = exp(-qeq/alph/4.0_r64)/qeq
+                end if
                 do iat = 1,crys%numatoms
                    zig(:)=matmul(g,crys%born(:,:,iat))                   
                    do jat = 1,crys%numatoms
